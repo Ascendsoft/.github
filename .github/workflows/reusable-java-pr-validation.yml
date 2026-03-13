@@ -1,0 +1,44 @@
+name: Reusable Java PR Validation
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        required: true
+        type: string
+      java_version:
+        required: false
+        type: string
+        default: '21'
+
+jobs:
+  validate:
+    name: PR Validation — ${{ inputs.service_name }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Compile
+        run: mvn compile -q -B
+
+      - name: Checkstyle
+        run: mvn checkstyle:check -B
+        continue-on-error: true
+
+      - name: Run tests (P0 + P1)
+        run: mvn test -B -Dtest.groups="p0,p1"
+
+      - name: Validation summary
+        if: always()
+        run: |
+          echo "## PR Validation Summary — ${{ inputs.service_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Java: ${{ inputs.java_version }}" >> $GITHUB_STEP_SUMMARY
