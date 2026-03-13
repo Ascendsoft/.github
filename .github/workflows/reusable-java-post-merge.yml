@@ -1,0 +1,52 @@
+name: Reusable Java Post-Merge Full Test Suite
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        required: true
+        type: string
+      java_version:
+        required: false
+        type: string
+        default: '21'
+
+jobs:
+  full-suite:
+    name: Post-Merge Full Suite — ${{ inputs.service_name }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Compile
+        run: mvn compile -q -B
+
+      - name: Checkstyle
+        run: mvn checkstyle:check -B
+
+      - name: Run full test suite
+        run: mvn verify -B
+
+      - name: JaCoCo coverage report
+        run: |
+          if [ -f target/site/jacoco/index.html ]; then
+            echo "Coverage report generated"
+          else
+            echo "No JaCoCo report found (configure jacoco-maven-plugin)"
+          fi
+
+      - name: Post-merge summary
+        if: always()
+        run: |
+          echo "## Post-Merge Summary — ${{ inputs.service_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Java: ${{ inputs.java_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY

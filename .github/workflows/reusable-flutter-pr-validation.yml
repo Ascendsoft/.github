@@ -1,0 +1,43 @@
+name: Reusable Flutter PR Validation
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      flutter_version:
+        required: false
+        type: string
+        default: '3.24.0'
+
+jobs:
+  validate:
+    name: PR Validation — ${{ inputs.app_name }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Run tests
+        run: flutter test
+        continue-on-error: true
+
+      - name: Validation summary
+        if: always()
+        run: |
+          echo "## PR Validation Summary — ${{ inputs.app_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Flutter: ${{ inputs.flutter_version }}" >> $GITHUB_STEP_SUMMARY

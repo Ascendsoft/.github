@@ -1,0 +1,47 @@
+name: Reusable Flutter Post-Merge Validation
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      flutter_version:
+        required: false
+        type: string
+        default: '3.24.0'
+
+jobs:
+  full-suite:
+    name: Post-Merge Full Suite — ${{ inputs.app_name }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Run tests
+        run: flutter test
+
+      - name: Build APK (verify build)
+        run: flutter build apk --debug
+        continue-on-error: true
+
+      - name: Post-merge summary
+        if: always()
+        run: |
+          echo "## Post-Merge Summary — ${{ inputs.app_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Flutter: ${{ inputs.flutter_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
