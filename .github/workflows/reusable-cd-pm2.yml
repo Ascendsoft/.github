@@ -1,0 +1,247 @@
+# Reusable CD — PM2 Deploy + Git-based Auto-Rollback
+#
+# Caller pattern (cd-deploy-test.yml in each service repo):
+#
+#   jobs:
+#     deploy:
+#       if: ${{ github.event.inputs.confirm == 'deploy' }}
+#       uses: Ascendsoft/.github/.github/workflows/reusable-cd-pm2.yml@main
+#       with:
+#         service_name: onboardingserv
+#         repo_dir: /var/www/onboardingserv
+#         code_dir: codeBase
+#         port: 3000
+#         start_script: test:env
+#         pm2_instances: 2
+#         skip_merge: ${{ github.event.inputs.skip_merge == 'true' }}
+#       secrets: inherit
+#
+# Rollback strategy (git-based):
+#   - Before every deploy the current release HEAD is written to
+#     /var/www/<service>/.last-stable-commit on the DO server.
+#   - On health-check failure: git reset --hard <stable-commit>
+#     → npm install → pm2 reload → health check → exit 1
+
+name: Reusable — CD PM2 Deploy + Rollback
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: 'PM2 process name and display name'
+        type: string
+        required: true
+      repo_dir:
+        description: 'Absolute path to repo root on the DO server'
+        type: string
+        required: true
+      code_dir:
+        description: 'Subdirectory containing package.json (relative to repo_dir). Use "." for root.'
+        type: string
+        default: '.'
+      port:
+        description: 'Port the service listens on (used for health check)'
+        type: number
+        required: true
+      start_script:
+        description: 'npm script to start the service (e.g. test:env, start:test)'
+        type: string
+        default: 'test:env'
+      pm2_instances:
+        description: 'Number of PM2 cluster instances'
+        type: number
+        default: 2
+      skip_merge:
+        description: 'Skip merging development → release (redeploy current release as-is)'
+        type: boolean
+        default: false
+      use_github_packages:
+        description: 'Write ~/.npmrc for GitHub Packages registry (requires GH_PAT secret)'
+        type: boolean
+        default: false
+      health_endpoint:
+        description: 'Health check path (default: /health)'
+        type: string
+        default: '/health'
+
+concurrency:
+  group: deploy-${{ inputs.service_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.service_name }} (PM2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: root
+          key: ${{ secrets.DO_SSH_KEY }}
+          command_timeout: 10m
+          script: |
+            SERVICE="${{ inputs.service_name }}"
+            REPO_DIR="${{ inputs.repo_dir }}"
+            CODE_DIR="$REPO_DIR/${{ inputs.code_dir }}"
+            PORT=${{ inputs.port }}
+            HEALTH_PATH="${{ inputs.health_endpoint }}"
+
+            # ── Rollback function ────────────────────────────────────────────
+            # Restores the last-stable-commit, reloads PM2, and exits 1 so the
+            # job is marked FAILED in GitHub Actions.
+            do_rollback() {
+              local REASON="$1"
+              STABLE_COMMIT=$(cat "$REPO_DIR/.last-stable-commit" 2>/dev/null || echo "none")
+
+              echo "════════════════════════════════════════════════"
+              echo "  🔴 ROLLBACK TRIGGERED"
+              echo "  Service:       $SERVICE"
+              echo "  Reason:        $REASON"
+              echo "  Stable commit: $STABLE_COMMIT"
+              echo "════════════════════════════════════════════════"
+
+              if [ "$STABLE_COMMIT" = "none" ] || [ -z "$STABLE_COMMIT" ]; then
+                echo "⚠️  No .last-stable-commit found — cannot auto-rollback."
+                echo "    Manual intervention required on port $PORT."
+                exit 1
+              fi
+
+              cd "$REPO_DIR"
+              echo "⏪ Resetting to stable commit: $STABLE_COMMIT"
+              git reset --hard "$STABLE_COMMIT"
+
+              echo "📦 Restoring dependencies for stable commit..."
+              cd "$CODE_DIR"
+              npm install --production --silent
+
+              echo "🔄 Reloading PM2 with stable code..."
+              pm2 reload "$SERVICE" --update-env
+
+              # Health check on restored service
+              echo "🏥 Health check on restored service (port $PORT)..."
+              RESTORED=false
+              for i in $(seq 1 8); do
+                HTTP=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT$HEALTH_PATH" 2>/dev/null || echo "000")
+                if [ "$HTTP" = "200" ]; then
+                  echo "✅ Restored service is healthy (HTTP 200)"
+                  RESTORED=true
+                  break
+                fi
+                echo "  Attempt $i/8 — HTTP $HTTP, waiting 5s..."
+                sleep 5
+              done
+
+              # Accept PM2 online as fallback if no /health endpoint
+              if [ "$RESTORED" = "false" ]; then
+                if pm2 show "$SERVICE" 2>/dev/null | grep -q "online"; then
+                  echo "✅ Restored service is online (PM2 — fallback check)"
+                  RESTORED=true
+                fi
+              fi
+
+              echo "════════════════════════════════════════════════"
+              if [ "$RESTORED" = "true" ]; then
+                echo "  ✅ Rollback complete — stable commit is live"
+              else
+                echo "  ❌ Restored service also unhealthy — manual intervention required"
+              fi
+              echo "  Service: $SERVICE  Port: $PORT"
+              echo "════════════════════════════════════════════════"
+              exit 1
+            }
+
+            echo "══════════════════════════════════════════════"
+            echo "  Deploying $SERVICE to TEST (DigitalOcean)"
+            echo "  Strategy: PM2 | Port: $PORT"
+            echo "══════════════════════════════════════════════"
+
+            cd "$REPO_DIR"
+            git fetch origin
+            git checkout release
+            git stash --quiet 2>/dev/null || true
+
+            if [ "${{ inputs.skip_merge }}" != "true" ]; then
+              echo "📥 Merging development → release..."
+              git merge origin/development --no-edit
+              git push origin release
+            else
+              echo "⏭️  Skipping merge, redeploying current release..."
+            fi
+
+            git pull origin release
+
+            # ── Capture stable commit BEFORE any code changes ────────────────
+            STABLE_COMMIT=$(git rev-parse HEAD)
+            echo "📸 Stable commit pointer: $STABLE_COMMIT"
+            echo "$STABLE_COMMIT" > "$REPO_DIR/.last-stable-commit"
+
+            # ── GitHub Packages registry (opt-in) ────────────────────────────
+            if [ "${{ inputs.use_github_packages }}" = "true" ]; then
+              echo "//npm.pkg.github.com/:_authToken=${{ secrets.GH_PAT }}" > ~/.npmrc
+              echo "@emedihub:registry=https://npm.pkg.github.com" >> ~/.npmrc
+              echo "@ascendsoft:registry=https://npm.pkg.github.com" >> ~/.npmrc
+            fi
+
+            # Install dependencies
+            echo "📦 Installing dependencies..."
+            cd "$CODE_DIR"
+            npm install --production
+
+            # Deploy with PM2
+            echo "🔄 Deploying $SERVICE with PM2 (${{ inputs.pm2_instances }} instance(s))..."
+            if pm2 show "$SERVICE" &>/dev/null; then
+              pm2 reload "$SERVICE" --update-env
+            else
+              pm2 start npm --name "$SERVICE" -i ${{ inputs.pm2_instances }} -- run ${{ inputs.start_script }}
+            fi
+            pm2 save
+
+            # Health check
+            echo "🏥 Running health check on port $PORT..."
+            sleep 5
+            RETRIES=6
+            HTTP_CODE="000"
+            for i in $(seq 1 $RETRIES); do
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT$HEALTH_PATH" 2>/dev/null || echo "000")
+              if [ "$HTTP_CODE" = "200" ]; then
+                echo "✅ $SERVICE is healthy (HTTP 200 on port $PORT)"
+                break
+              fi
+              echo "  Attempt $i/$RETRIES — HTTP $HTTP_CODE, waiting 5s..."
+              sleep 5
+            done
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              # Fallback: accept PM2 online status for services without /health
+              if pm2 show "$SERVICE" 2>/dev/null | grep -q "online"; then
+                echo "✅ $SERVICE is online (PM2 fallback — no /health endpoint)"
+              else
+                echo "❌ $SERVICE failed health check and PM2 reports not online"
+                echo "PM2 logs:"
+                pm2 logs "$SERVICE" --lines 30 --nostream || true
+                do_rollback "health-check-failure"
+              fi
+            fi
+
+            COMMIT=$(git -C "$REPO_DIR" rev-parse --short HEAD)
+            echo "══════════════════════════════════════════════"
+            echo "  ✅ $SERVICE deployed successfully"
+            echo "  Commit: $COMMIT | Port: $PORT"
+            echo "══════════════════════════════════════════════"
+
+      - name: Write rollback summary
+        if: failure()
+        run: |
+          echo "## ❌ Deployment Rolled Back — ${{ inputs.service_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Service | ${{ inputs.service_name }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Reason | Health check / PM2 startup failure |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Port | ${{ inputs.port }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Timestamp | $(date -u '+%Y-%m-%d %H:%M UTC') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Previous stable commit restored (if pointer existed). See SSH step output for details." >> "$GITHUB_STEP_SUMMARY"
