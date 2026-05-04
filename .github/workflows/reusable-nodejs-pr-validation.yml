@@ -46,9 +46,13 @@ jobs:
           node-version: ${{ inputs.node_version }}
           cache: 'npm'
           cache-dependency-path: '${{ inputs.working_directory }}/package-lock.json'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@emedihub'
 
       - name: Install dependencies
         run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Lint
         if: inputs.has_lint
