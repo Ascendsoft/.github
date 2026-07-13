@@ -52,6 +52,9 @@ jobs:
           registry-url: 'https://npm.pkg.github.com'
           scope: '@emedihub'
 
+      - name: Configure @ascendsoft scope
+        run: echo "@ascendsoft:registry=https://npm.pkg.github.com" >> ~/.npmrc
+
       - name: Install dependencies
         run: npm ci
         env:
