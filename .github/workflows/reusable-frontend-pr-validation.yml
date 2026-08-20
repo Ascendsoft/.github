@@ -23,10 +23,16 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   validate:
     name: PR Validation — ${{ inputs.app_name }}
     runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout
